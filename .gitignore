@@ -1,0 +1,38 @@
+# Ambiente Python
+.venv/
+env/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Dati (non tracciati, troppo pesanti o sensibili)
+data/raw/*.csv
+data/raw/*.parquet
+data/processed/*.parquet
+data/processed/*.csv
+!data/raw/earnings_calendar_raw.csv
+!data/raw/fundamentals_raw.csv
+
+# Report generati
+reports/figures/*.png
+reports/figures/*.pdf
+reports/paper/*.pdf
+reports/paper/*.docx
+
+# Modelli salvati
+models/
+*.pkl
+*.joblib
+
+# Sistema
+.DS_Store
+Thumbs.db
+*.log

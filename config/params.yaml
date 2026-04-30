@@ -1,0 +1,96 @@
+# ============================================================
+# Parametri globali del progetto PEAD Banks Europe
+# ============================================================
+
+# -- Universo titoli --
+tickers:
+  - ISP.MI
+  - UCG.MI
+  - SAN.MC
+  - BNP.PA
+  - DBK.DE
+
+benchmark: "^STOXX50E"
+
+it_banks:
+  - ISP.MI
+  - UCG.MI
+
+# -- Periodo di analisi --
+start_date: "2016-01-01"
+end_date:   "2026-04-30"
+
+# -- Preprocessing --
+vol_lookback: 60        # gg per volatilità rolling
+max_vol: 0.035          # soglia max volatilità giornaliera per filtrare eventi
+
+# -- Metriche PEAD --
+ear_window: 1           # gg [-window, +window] intorno alla earnings date per EAR
+orj_offset: 1           # gg dopo annuncio per calcolo ORJ (post-open)
+sue_lookback: 8         # eventi precedenti per calcolo SUE proxy
+vol_spike_lookback: 20  # gg per media volume rolling (spike)
+
+# -- Score lineare PEAD --
+w_orj: 0.6
+w_sue: 0.4
+
+# -- Composite Bank Score --
+weight_sue:       0.30
+weight_ofi:       0.25
+weight_guidance:  0.20
+weight_cet1surp:  0.15
+weight_volspike:  0.10
+
+# -- Grading soglie --
+grade_high: 0.70
+grade_low:  0.30
+
+# -- Filtri fondamentali --
+min_roe:          0.08
+max_pe:           15.0
+min_quality:      0.0
+min_cet1:         0.13
+min_cet1_surp:    0.0
+min_nim_surp:     0.0
+max_prov_surp:    0.0
+
+# -- Strategia overnight --
+overnight_hold_days: 1     # gg di detenzione post-annuncio
+overnight_orj_thr:  0.0    # soglia minima ORJ per ingresso
+
+# -- Strategia drift 60gg --
+drift_hold_days:    60
+top_quantile:       0.80   # top X% CompositeBankScore per long
+bottom_quantile:    0.20   # bottom X% per short
+
+# -- Rischio e sizing --
+risk_capital:       1.0    # unità di capitale di riferimento
+risk_per_trade:     0.02   # 2% max rischio per trade
+K_vol_stop:         2.0    # stop = entry * (1 - K * vol_daily)
+
+# -- Costi di transazione --
+commission_rate:    0.0005  # 0.05% per lato
+slippage_normal:    0.0003  # 0.03% per lato (trade normale)
+slippage_event:     0.0010  # 0.10% per lato (intorno all'annuncio)
+
+# -- Portafoglio combinato --
+weight_overnight:   0.30
+weight_drift60:     0.70
+
+# -- ML: logit + RF --
+tscv_splits:        5
+rf_n_estimators:    300
+rf_max_depth:       5
+rf_min_samples_leaf: 50
+rf_random_state:    42
+
+# -- Paths --
+paths:
+  raw_earnings:    "data/raw/earnings_calendar_raw.csv"
+  raw_fund:        "data/raw/fundamentals_raw.csv"
+  prices_parquet:  "data/processed/prices.parquet"
+  fund_processed:  "data/processed/fundamentals.csv"
+  signals_out:     "data/processed/signals.csv"
+  trades_out:      "data/processed/trades.csv"
+  figures_dir:     "reports/figures/"
+  paper_draft:     "reports/paper/draft_PEAD_banks.md"

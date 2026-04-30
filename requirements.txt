@@ -1,0 +1,21 @@
+# Core
+pandas>=2.0
+numpy>=1.25
+
+# Dati finanziari
+yfinance>=0.2.40
+
+# Visualizzazione
+matplotlib>=3.7
+seaborn>=0.13
+
+# Machine Learning
+scikit-learn>=1.4
+
+# Notebook
+jupyterlab>=4.0
+ipykernel>=6.0
+
+# Utilità
+pyyaml>=6.0
+fastparquet>=2023.0
