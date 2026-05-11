@@ -1,232 +1,141 @@
 """
 src/data_loading.py
-====================
-Caricamento e download dati: prezzi OHLCV, earnings calendar, fondamentali.
-
-TODO (dati reali):
- - Sostituire generate_earnings_calendar() con CSV reale da:
-   MarketScreener, Bloomberg, Refinitiv, FactSet, Yahoo Finance Earnings
-   Formato: ticker,earn_date  (es. ISP.MI,2024-02-08)
- - Sostituire load_fundamentals() con dataset reale contenente:
-   EPS actual/consensus, CET1 actual/target, NIM, provisioni IFRS9, guidance flag
-   Formato: ticker,date,pe,roe,div_yield,quality_score,cet1,cet1_surprise,
-            nim,nim_surprise,prov_surprise,guidance_score
+Data ingestion: prices (yfinance), synthetic earnings events, macro proxies.
+All data is fetched with strict date ordering and no future information.
 """
 
-from __future__ import annotations
-from pathlib import Path
-import logging
-import yaml
-import numpy as np
+import warnings
+warnings.filterwarnings("ignore")
+
 import pandas as pd
+import numpy as np
 import yfinance as yf
+from datetime import date, timedelta
+from typing import Dict, List, Optional
 
-ROOT     = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "data" / "processed"
-RAW_DIR  = ROOT / "data" / "raw"
-CFG_PATH = ROOT / "config" / "params.yaml"
-
-logger = logging.getLogger(__name__)
-
-
-# ------------------------------------------------------------------
-# Config
-# ------------------------------------------------------------------
-
-def load_config() -> dict:
-    """Carica params.yaml."""
-    with open(CFG_PATH, "r") as f:
-        return yaml.safe_load(f)
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from config.experiment import UNIVERSE, START_DATE, END_DATE, EARNINGS_APPROX, MARKET_PROXY
 
 
-# ------------------------------------------------------------------
-# Prezzi
-# ------------------------------------------------------------------
-
-def download_prices(save: bool = True) -> pd.DataFrame:
+def load_prices(tickers: Optional[List[str]] = None,
+               start: str = START_DATE,
+               end: str = END_DATE) -> pd.DataFrame:
     """
-    Scarica OHLCV giornaliero per tutti i ticker + benchmark via yfinance.
-    Salva in data/processed/prices.parquet.
+    Download adjusted daily OHLCV for all universe banks + market proxy.
+    Returns a MultiIndex DataFrame (ticker, field) → long panel.
     """
-    cfg       = load_config()
-    tickers   = cfg["universe"]["tickers"]
-    benchmark = cfg["universe"]["benchmark"]
-    start     = cfg["project"]["start_date"]
-    end       = cfg["project"]["end_date"]
-    all_t     = tickers + [benchmark]
-
-    logger.info("Download prezzi: %s", all_t)
-    data = yf.download(all_t, start=start, end=end, auto_adjust=False)
-
-    if save:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        data.to_parquet(DATA_DIR / "prices.parquet")
-        logger.info("Salvati in %s", DATA_DIR / "prices.parquet")
-    return data
+    if tickers is None:
+        tickers = list(UNIVERSE.keys()) + [MARKET_PROXY]
+    raw = yf.download(tickers, start=start, end=end,
+                      auto_adjust=True, progress=False, threads=True)
+    # flatten MultiIndex columns: (field, ticker) → ticker_field
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = [f"{ticker}_{field}" for field, ticker in raw.columns]
+    raw.index = pd.to_datetime(raw.index)
+    raw = raw.sort_index()
+    return raw
 
 
-def load_prices() -> pd.DataFrame:
-    """Carica prezzi da parquet (scarica se mancante)."""
-    p = DATA_DIR / "prices.parquet"
-    if not p.exists():
-        logger.warning("prices.parquet mancante, scarico ora...")
-        return download_prices(save=True)
-    return pd.read_parquet(p)
-
-
-def extract_price_series(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def build_long_panel(prices_wide: pd.DataFrame,
+                     tickers: Optional[List[str]] = None) -> pd.DataFrame:
     """
-    Estrae Close, Open, Volume, AdjClose da DataFrame multi-level yfinance.
-    Ritorna (close, open_, volume, adj_close).
+    Reshape wide prices DataFrame into long panel:
+    (date, ticker) with columns: open, high, low, close, volume.
     """
-    close     = data["Close"]
-    open_     = data["Open"]
-    volume    = data["Volume"]
-    adj_close = data["Adj Close"] if "Adj Close" in data.columns.get_level_values(0) else close
-    return close, open_, volume, adj_close
+    if tickers is None:
+        tickers = list(UNIVERSE.keys())
+    records = []
+    for tk in tickers:
+        cols = {"close": f"{tk}_Close", "open": f"{tk}_Open",
+                "high": f"{tk}_High",  "low": f"{tk}_Low",
+                "volume": f"{tk}_Volume"}
+        avail = {k: v for k, v in cols.items() if v in prices_wide.columns}
+        if "close" not in avail:
+            continue
+        sub = prices_wide[[avail[k] for k in avail]].copy()
+        sub.columns = list(avail.keys())
+        sub["ticker"] = tk
+        sub["name"]   = UNIVERSE.get(tk, tk)
+        sub.index.name = "date"
+        records.append(sub.reset_index())
+    panel = pd.concat(records, ignore_index=True)
+    panel = panel.dropna(subset=["close"])
+    panel = panel[panel["close"] > 0]
+    panel["ret_1d"] = panel.groupby("ticker")["close"].pct_change()
+    return panel
 
 
-# ------------------------------------------------------------------
-# Earnings calendar
-# ------------------------------------------------------------------
-
-def generate_earnings_calendar(prices_index: pd.DatetimeIndex) -> pd.DataFrame:
+def build_events_synthetic(years_range: Optional[range] = None) -> pd.DataFrame:
     """
-    Genera calendario earnings SINTETICO (placeholder).
-
-    TODO: sostituire con dati reali.
-    CSV atteso in data/raw/earnings_calendar_raw.csv:
-        ticker,earn_date
-        ISP.MI,2024-02-08
-        UCG.MI,2024-02-07
+    Build synthetic earnings event dates from config.EARNINGS_APPROX.
+    For each (ticker, year, quarter) generates an event_date.
+    Flag: event_type = 'synthetic'.
     """
-    cfg        = load_config()
-    tickers    = cfg["universe"]["tickers"]
-    months     = cfg["pead"]["earnings_months"]
-    day        = cfg["pead"]["earnings_day"]
-    start_year = prices_index.min().year
-    end_year   = prices_index.max().year
-
+    if years_range is None:
+        years_range = range(
+            int(START_DATE[:4]),
+            int(END_DATE[:4]) + 1
+        )
     rows = []
-    for t in tickers:
-        for y in range(start_year, end_year + 1):
-            for m in months:
+    for ticker, dates_list in EARNINGS_APPROX.items():
+        for year in years_range:
+            for q_idx, (month, day) in enumerate(dates_list, start=1):
                 try:
-                    d = pd.Timestamp(year=y, month=m, day=day)
-                    if prices_index.min() <= d <= prices_index.max():
-                        rows.append({"ticker": t, "earn_date": d})
+                    evt_date = pd.Timestamp(year=year, month=month, day=day)
                 except ValueError:
-                    pass
-    return pd.DataFrame(rows).sort_values(["ticker", "earn_date"]).reset_index(drop=True)
+                    continue
+                rows.append({
+                    "ticker":     ticker,
+                    "event_date": evt_date,
+                    "quarter":    f"{year}Q{q_idx}",
+                    "event_type": "synthetic",
+                })
+    ev = pd.DataFrame(rows)
+    ev = ev.sort_values(["ticker", "event_date"]).reset_index(drop=True)
+    ev["event_id"] = ev.index
+    return ev
 
 
-def load_earnings_calendar(prices_index: pd.DatetimeIndex) -> pd.DataFrame:
+def load_market_returns(prices_wide: pd.DataFrame,
+                        market_col: str = f"{MARKET_PROXY}_Close") -> pd.Series:
     """
-    Carica calendario earnings:
-    - usa data/raw/earnings_calendar_raw.csv se presente (dati REALI),
-    - altrimenti genera calendario sintetico (PLACEHOLDER).
-
-    TODO: popolare earnings_calendar_raw.csv con dati reali prima del go-live.
+    Extract daily market returns from the wide panel.
     """
-    raw = RAW_DIR / "earnings_calendar_raw.csv"
-    if raw.exists():
-        df = pd.read_csv(raw, parse_dates=["earn_date"])
-        logger.info("Calendario reale: %s (%d righe)", raw, len(df))
-        return df.sort_values(["ticker", "earn_date"]).reset_index(drop=True)
+    if market_col not in prices_wide.columns:
+        cols = [c for c in prices_wide.columns if MARKET_PROXY in c and "Close" in c]
+        if not cols:
+            return pd.Series(dtype=float, name="market_ret")
+        market_col = cols[0]
+    mkt = prices_wide[market_col].pct_change()
+    mkt.name = "market_ret"
+    return mkt
 
-    logger.warning(
-        "TODO: earnings_calendar_raw.csv non trovato. "
-        "Uso PLACEHOLDER sintetico - risultati NON realistici."
+
+def merge_events_with_prices(events: pd.DataFrame,
+                             panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    Left-join events onto the panel: for each event find the
+    nearest trading day (±3 days) in the price panel.
+    """
+    trading_days = (
+        panel.groupby("ticker")["date"]
+        .apply(lambda s: sorted(s.unique()))
+        .to_dict()
     )
-    return generate_earnings_calendar(prices_index)
 
-
-# ------------------------------------------------------------------
-# Fondamentali (IFRS9 / CET1 / NIM)
-# ------------------------------------------------------------------
-
-def load_fundamentals() -> pd.DataFrame:
-    """
-    Carica fondamentali per filtro qualita/IFRS9.
-
-    TODO: sostituire con dataset reale.
-    CSV atteso in data/raw/fundamentals_raw.csv con colonne:
-        ticker, date, pe, roe, div_yield, quality_score,
-        cet1, cet1_surprise, nim, nim_surprise, prov_surprise, guidance_score
-
-    I valori placeholder ISP/UCG sono indicativi basati su:
-    - Intesa Sanpaolo Annual Report 2023/2024/2025
-    - UniCredit Investor Relations 2023/2024/2025
-    NON usare in produzione senza sostituire con dati reali verificati.
-    """
-    raw = RAW_DIR / "fundamentals_raw.csv"
-    if raw.exists():
-        df = pd.read_csv(raw, parse_dates=["date"])
-        logger.info("Fondamentali reali: %s (%d righe)", raw, len(df))
-        return df.sort_values(["ticker", "date"]).reset_index(drop=True)
-
-    logger.warning(
-        "TODO: fundamentals_raw.csv non trovato. "
-        "Uso PLACEHOLDER ISP/UCG 2023-2025 - NON usare in produzione."
-    )
-    # --- PLACEHOLDER ---
-    rows = [
-        # ISP.MI - Intesa Sanpaolo
-        # CET1 FL ~13.6-13.9%, ROE ~13-15%, div yield ~7.5-9.8%
-        # Fonte: Intesa Annual Report / Comunicati stampa risultati
-        {"ticker":"ISP.MI","date":pd.Timestamp("2023-12-31"),
-         "pe":8.5, "roe":0.130,"div_yield":0.075,"quality_score":0.80,
-         "cet1":0.136,"cet1_surprise":0.001,"nim":0.019,"nim_surprise":0.001,
-         "prov_surprise":-0.03,"guidance_score":1},
-        {"ticker":"ISP.MI","date":pd.Timestamp("2024-12-31"),
-         "pe":7.0, "roe":0.140,"div_yield":0.098,"quality_score":0.85,
-         "cet1":0.138,"cet1_surprise":0.002,"nim":0.020,"nim_surprise":0.001,
-         "prov_surprise":-0.04,"guidance_score":1},
-        {"ticker":"ISP.MI","date":pd.Timestamp("2025-12-31"),
-         "pe":6.5, "roe":0.150,"div_yield":0.090,"quality_score":0.88,
-         "cet1":0.139,"cet1_surprise":0.002,"nim":0.020,"nim_surprise":0.001,
-         "prov_surprise":-0.05,"guidance_score":1},
-        # UCG.MI - UniCredit
-        # CET1 FL ~15.8-16.0%, ROE ~15-16.2%, div yield ~4.5-5.5%
-        # Fonte: UniCredit Investor Relations / Comunicati stampa risultati
-        {"ticker":"UCG.MI","date":pd.Timestamp("2023-12-31"),
-         "pe":7.5, "roe":0.150,"div_yield":0.045,"quality_score":0.80,
-         "cet1":0.158,"cet1_surprise":0.002,"nim":0.020,"nim_surprise":0.001,
-         "prov_surprise":-0.06,"guidance_score":1},
-        {"ticker":"UCG.MI","date":pd.Timestamp("2024-12-31"),
-         "pe":6.8, "roe":0.155,"div_yield":0.050,"quality_score":0.85,
-         "cet1":0.159,"cet1_surprise":0.003,"nim":0.021,"nim_surprise":0.002,
-         "prov_surprise":-0.07,"guidance_score":1},
-        {"ticker":"UCG.MI","date":pd.Timestamp("2025-12-31"),
-         "pe":6.0, "roe":0.162,"div_yield":0.055,"quality_score":0.90,
-         "cet1":0.160,"cet1_surprise":0.003,"nim":0.021,"nim_surprise":0.002,
-         "prov_surprise":-0.08,"guidance_score":1},
-        # Banche peer - TODO: dati reali
-        {"ticker":"SAN.MC","date":pd.Timestamp("2024-12-31"),
-         "pe":7.0, "roe":0.120,"div_yield":0.050,"quality_score":0.75,
-         "cet1":0.126,"cet1_surprise":0.001,"nim":0.018,"nim_surprise":0.001,
-         "prov_surprise":-0.02,"guidance_score":0},
-        {"ticker":"BNP.PA","date":pd.Timestamp("2024-12-31"),
-         "pe":6.5, "roe":0.100,"div_yield":0.060,"quality_score":0.75,
-         "cet1":0.130,"cet1_surprise":0.001,"nim":0.017,"nim_surprise":0.000,
-         "prov_surprise":-0.01,"guidance_score":0},
-        {"ticker":"DBK.DE","date":pd.Timestamp("2024-12-31"),
-         "pe":8.0, "roe":0.085,"div_yield":0.030,"quality_score":0.65,
-         "cet1":0.135,"cet1_surprise":0.001,"nim":0.016,"nim_surprise":0.000,
-         "prov_surprise": 0.01,"guidance_score":0},
-    ]
-    return pd.DataFrame(rows).sort_values(["ticker","date"]).reset_index(drop=True)
-
-
-def get_fundamentals_at(fund_df: pd.DataFrame, ticker: str, date: pd.Timestamp) -> dict | None:
-    """Fondamentali piu recenti per ticker alla data."""
-    sub = fund_df[(fund_df["ticker"] == ticker) & (fund_df["date"] <= date)]
-    if sub.empty:
+    def nearest_trading_day(ticker, target_date):
+        days = trading_days.get(ticker, [])
+        if not days:
+            return None
+        deltas = [(abs((pd.Timestamp(d) - target_date).days), d) for d in days]
+        best = min(deltas, key=lambda x: x[0])
+        if best[0] <= 3:
+            return best[1]
         return None
-    return sub.iloc[-1].to_dict()
 
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    d = download_prices(save=True)
-    logger.info("Done. Shape: %s", d.shape)
+    events = events.copy()
+    events["event_trading_date"] = events.apply(
+        lambda r: nearest_trading_day(r["ticker"], r["event_date"]), axis=1
+    )
+    return events.dropna(subset=["event_trading_date"])

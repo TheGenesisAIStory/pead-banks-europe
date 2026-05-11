@@ -1,150 +1,243 @@
-"""reporting.py
-Metriche di performance e report: Sharpe, Sortino, Max Drawdown, grade report.
 """
+src/reporting.py
+All publication-grade plots and table exports.
+Designed to be called from the Colab notebook.
+"""
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from pathlib import Path
+import matplotlib.ticker as mtick
+import seaborn as sns
+from sklearn.metrics import roc_curve, auc
+from sklearn.calibration import calibration_curve
+from typing import Dict, List, Optional
+
+PLT_STYLE = {
+    "figure.facecolor":  "#0e1117",
+    "axes.facecolor":    "#161b22",
+    "axes.edgecolor":    "#30363d",
+    "axes.labelcolor":   "#c9d1d9",
+    "xtick.color":       "#8b949e",
+    "ytick.color":       "#8b949e",
+    "text.color":        "#c9d1d9",
+    "grid.color":        "#21262d",
+    "grid.linestyle":    "--",
+    "legend.facecolor":  "#161b22",
+    "legend.edgecolor":  "#30363d",
+}
+PALETTE = ["#58a6ff", "#3fb950", "#f78166", "#d2a8ff",
+           "#ffa657", "#79c0ff", "#56d364", "#ff7b72"]
 
 
-# ------------------------------------------------------------------
-# Metriche
-# ------------------------------------------------------------------
-
-def max_drawdown(equity: pd.Series) -> tuple[float, pd.Series]:
-    roll_max = equity.cummax()
-    dd = equity / roll_max - 1.0
-    return dd.min(), dd
+def _apply_style():
+    plt.rcParams.update(PLT_STYLE)
 
 
-def sharpe_ratio(returns: pd.Series, rf: float = 0.0, periods: int = 252) -> float:
-    excess = returns - rf / periods
-    if excess.std() == 0:
-        return np.nan
-    return (excess.mean() / excess.std()) * np.sqrt(periods)
+def plot_universe_coverage(panel: pd.DataFrame, events: pd.DataFrame,
+                            save_path: Optional[str] = None):
+    """Bar chart: tickers with prices vs tickers with events."""
+    _apply_style()
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
+    # Left: observations per ticker
+    obs = panel.groupby("ticker").size().sort_values(ascending=False)
+    axes[0].barh(obs.index, obs.values, color=PALETTE[0], alpha=0.85)
+    axes[0].set_title("Trading Days per Bank", fontsize=13, fontweight="bold")
+    axes[0].set_xlabel("Number of trading days")
+    axes[0].invert_yaxis()
 
-def sortino_ratio(returns: pd.Series, rf: float = 0.0, periods: int = 252) -> float:
-    excess = returns - rf / periods
-    down = excess[excess < 0]
-    if down.std() == 0:
-        return np.nan
-    return (excess.mean() / down.std()) * np.sqrt(periods)
+    # Right: events per ticker
+    evobs = events.groupby("ticker").size().sort_values(ascending=False)
+    axes[1].barh(evobs.index, evobs.values, color=PALETTE[1], alpha=0.85)
+    axes[1].set_title("Earnings Events per Bank", fontsize=13, fontweight="bold")
+    axes[1].set_xlabel("Number of events")
+    axes[1].invert_yaxis()
 
-
-def calmar_ratio(equity: pd.Series, periods: int = 252) -> float:
-    returns = equity.pct_change().dropna()
-    annual_ret = (equity.iloc[-1] / equity.iloc[0]) ** (periods / len(equity)) - 1
-    mdd, _ = max_drawdown(equity)
-    if mdd == 0:
-        return np.nan
-    return annual_ret / abs(mdd)
-
-
-# ------------------------------------------------------------------
-# Report riassuntivo
-# ------------------------------------------------------------------
-
-def strategy_stats(trades_df: pd.DataFrame,
-                   ret_col: str = "ret_net",
-                   name: str = "",
-                   periods_per_year: int = 12) -> dict:
-    rets = trades_df[ret_col].dropna()
-    equity = (1 + rets).cumprod()
-    mdd, _ = max_drawdown(equity)
-    sh = sharpe_ratio(rets, periods=periods_per_year)
-    so = sortino_ratio(rets, periods=periods_per_year)
-    cal = calmar_ratio(equity, periods=periods_per_year)
-    return {
-        "strategy": name,
-        "n_trades": len(rets),
-        "mean_ret": rets.mean(),
-        "med_ret": rets.median(),
-        "std_ret": rets.std(),
-        "sharpe": sh,
-        "sortino": so,
-        "calmar": cal,
-        "max_drawdown": mdd,
-        "total_return": equity.iloc[-1] - 1 if len(equity) else np.nan,
-    }
-
-
-def full_report(ov_df: pd.DataFrame, dr_df: pd.DataFrame,
-                combined_equity: pd.Series) -> pd.DataFrame:
-    """Genera tabella riassuntiva per tutte e tre le configurazioni."""
-    stats_ov = strategy_stats(ov_df, name="Overnight ORJ/DriftScore", periods_per_year=52)
-    stats_dr = strategy_stats(dr_df, name="Drift 60gg (PEAD)", periods_per_year=252 // 60)
-    comb_rets = combined_equity.pct_change().dropna()
-    mdd_c, _ = max_drawdown(combined_equity)
-    stats_comb = {
-        "strategy": "Combined (overnight + drift60)",
-        "n_trades": stats_ov["n_trades"] + stats_dr["n_trades"],
-        "mean_ret": comb_rets.mean(),
-        "med_ret": comb_rets.median(),
-        "std_ret": comb_rets.std(),
-        "sharpe": sharpe_ratio(comb_rets),
-        "sortino": sortino_ratio(comb_rets),
-        "calmar": calmar_ratio(combined_equity),
-        "max_drawdown": mdd_c,
-        "total_return": combined_equity.iloc[-1] - 1,
-    }
-    return pd.DataFrame([stats_ov, stats_dr, stats_comb])
-
-
-# ------------------------------------------------------------------
-# Grade report
-# ------------------------------------------------------------------
-
-def grade_report(signals_df: pd.DataFrame,
-                 grade_col: str = "grade_ens",
-                 ret_col: str = "drift_60d",
-                 it_tickers: list = None) -> pd.DataFrame:
-    if it_tickers is None:
-        it_tickers = ["ISP.MI", "UCG.MI"]
-    df = signals_df.dropna(subset=[grade_col, ret_col]).copy()
-    df["bucket"] = np.where(df["ticker"].isin(it_tickers), "IT_banks", "Other_banks")
-    return (
-        df.groupby([grade_col, "bucket"])[ret_col]
-        .agg(n_trades="count", mean_ret="mean", med_ret="median", std_ret="std")
-        .reset_index()
-    )
-
-
-# ------------------------------------------------------------------
-# Visualizzazioni
-# ------------------------------------------------------------------
-
-def plot_equity(ov_df: pd.DataFrame, dr_df: pd.DataFrame,
-                combined: pd.Series, save_path: str | None = None):
-    fig, ax = plt.subplots(figsize=(11, 5))
-    ov_s = ov_df.sort_values("entry_date")
-    dr_s = dr_df.sort_values("entry_date")
-    ov_s["equity"] = (1 + ov_s["ret_net"]).cumprod()
-    dr_s["equity"] = (1 + dr_s["ret_net"]).cumprod()
-    ax.plot(ov_s["entry_date"], ov_s["equity"], label="Overnight ORJ/DriftScore", alpha=0.75)
-    ax.plot(dr_s["entry_date"], dr_s["equity"], label="Drift 60gg (PEAD)", alpha=0.75)
-    ax.plot(combined.index, combined.values, label="Portafoglio Combinato", lw=2)
-    ax.set_title("Equity line strategie PEAD - Banche Europee")
-    ax.set_ylabel("Valore (base 1)")
-    ax.legend()
     plt.tight_layout()
     if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=150)
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
 
 
-def plot_grade_returns(grade_rep: pd.DataFrame, save_path: str | None = None):
-    pivot = grade_rep.pivot_table(index="grade_logit" if "grade_logit" in grade_rep.columns else grade_rep.columns[0],
-                                   columns="bucket", values="mean_ret")
-    pivot.plot(kind="bar", figsize=(8, 4), title="Rendimento medio per grado e bucket (IT vs Other banks)")
-    plt.ylabel("Mean return (drift 60gg)")
+def plot_events_timeline(events: pd.DataFrame, save_path: Optional[str] = None):
+    """Events per quarter timeline."""
+    _apply_style()
+    ev = events.copy()
+    ev["ym"] = pd.to_datetime(ev["event_date"]).dt.to_period("Q").astype(str)
+    cnt = ev.groupby("ym").size()
+    fig, ax = plt.subplots(figsize=(16, 4))
+    ax.bar(range(len(cnt)), cnt.values, color=PALETTE[2], alpha=0.85)
+    ax.set_xticks(range(0, len(cnt), 4))
+    ax.set_xticklabels(cnt.index[::4], rotation=45, ha="right", fontsize=9)
+    ax.set_title("Earnings Events per Quarter", fontsize=13, fontweight="bold")
+    ax.set_ylabel("N events")
     plt.tight_layout()
     if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=150)
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
 
 
-if __name__ == "__main__":
-    print("reporting: usa full_report(), grade_report(), plot_equity() dal notebook.")
+def plot_drift_distributions(ef: pd.DataFrame, save_path: Optional[str] = None):
+    """Distribution of drift_5d, drift_20d, drift_60d."""
+    _apply_style()
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    for i, h in enumerate([5, 20, 60]):
+        col = f"drift_{h}d"
+        if col not in ef.columns:
+            continue
+        d = ef[col].dropna()
+        axes[i].hist(d, bins=40, color=PALETTE[i], alpha=0.8, edgecolor="none")
+        axes[i].axvline(0, color="white", linestyle="--", linewidth=1)
+        axes[i].axvline(d.mean(), color=PALETTE[4], linestyle="-", linewidth=1.5,
+                        label=f"mean={d.mean():.3f}")
+        axes[i].set_title(f"Drift {h}d distribution", fontweight="bold")
+        axes[i].set_xlabel("Abnormal return")
+        axes[i].legend(fontsize=9)
+    plt.suptitle("Post-Earnings Drift Distributions", fontsize=14, fontweight="bold", y=1.02)
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def plot_car_by_quantile(ef: pd.DataFrame, signal_col: str = "composite_score",
+                         drift_col: str = "drift_60d", n_q: int = 5,
+                         save_path: Optional[str] = None):
+    """Mean drift per quantile of signal — event study style."""
+    _apply_style()
+    df = ef.dropna(subset=[signal_col, drift_col]).copy()
+    df["q"] = pd.qcut(df[signal_col], n_q, labels=[f"Q{i+1}" for i in range(n_q)],
+                       duplicates="drop")
+    stats = df.groupby("q")[drift_col].agg(["mean", "sem"])
+    fig, ax = plt.subplots(figsize=(9, 5))
+    colors = [PALETTE[0] if i < n_q-1 else PALETTE[1] for i in range(len(stats))]
+    bars = ax.bar(stats.index, stats["mean"], yerr=1.96*stats["sem"],
+                  capsize=4, color=colors, alpha=0.85, edgecolor="none")
+    ax.axhline(0, color="white", linestyle="--", linewidth=1)
+    ax.set_title(f"Mean {drift_col} by {signal_col} Quintile",
+                 fontsize=13, fontweight="bold")
+    ax.set_xlabel("Quintile")
+    ax.set_ylabel("Mean abnormal return")
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1, decimals=1))
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def plot_ic_barh(ic_df: pd.DataFrame, save_path: Optional[str] = None):
+    """Horizontal bar chart of IC (Pearson corr with drift_60d) per feature."""
+    _apply_style()
+    df = ic_df.sort_values("ic", ascending=True)
+    colors = [PALETTE[1] if v > 0 else PALETTE[2] for v in df["ic"]]
+    fig, ax = plt.subplots(figsize=(10, max(6, len(df)*0.35)))
+    ax.barh(df["feature"], df["ic"], color=colors, alpha=0.85, edgecolor="none")
+    ax.axvline(0, color="white", linestyle="--", linewidth=1)
+    ax.set_title("Information Coefficient (IC) — Pearson corr with drift_60d",
+                 fontsize=13, fontweight="bold")
+    ax.set_xlabel("IC")
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def plot_roc_curves(oos: pd.DataFrame, model_names: List[str],
+                   save_path: Optional[str] = None):
+    """ROC curves for all models."""
+    _apply_style()
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for i, mn in enumerate(model_names):
+        col = f"p_{mn}"
+        if col not in oos.columns:
+            continue
+        sub = oos.dropna(subset=[col, "y_true"])
+        if len(sub) < 10:
+            continue
+        fpr, tpr, _ = roc_curve(sub["y_true"], sub[col])
+        roc_auc = auc(fpr, tpr)
+        ax.plot(fpr, tpr, color=PALETTE[i],
+                label=f"{mn.upper()} (AUC={roc_auc:.3f})", linewidth=2)
+    ax.plot([0,1],[0,1],"--",color="#8b949e",linewidth=1)
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("ROC Curves — OOS Walk-Forward", fontsize=13, fontweight="bold")
+    ax.legend(fontsize=10)
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def plot_calibration(oos: pd.DataFrame, model_names: List[str],
+                     save_path: Optional[str] = None):
+    """Calibration reliability diagrams."""
+    _apply_style()
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for i, mn in enumerate(model_names):
+        col = f"p_{mn}"
+        if col not in oos.columns:
+            continue
+        sub = oos.dropna(subset=[col, "y_true"])
+        if len(sub) < 10:
+            continue
+        frac_pos, mean_pred = calibration_curve(sub["y_true"], sub[col], n_bins=8)
+        ax.plot(mean_pred, frac_pos, "s-", color=PALETTE[i],
+                label=mn.upper(), linewidth=2)
+    ax.plot([0,1],[0,1],"--",color="#8b949e",linewidth=1,label="Perfect")
+    ax.set_xlabel("Mean predicted probability")
+    ax.set_ylabel("Observed frequency")
+    ax.set_title("Calibration Curves", fontsize=13, fontweight="bold")
+    ax.legend(fontsize=10)
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def plot_equity_curve(port_rets: pd.DataFrame,
+                      benchmark_rets: Optional[pd.Series] = None,
+                      save_path: Optional[str] = None):
+    """Equity curve + drawdown panel."""
+    _apply_style()
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8),
+                                    gridspec_kw={"height_ratios": [3, 1]})
+
+    for col, label, color in [
+        ("long_ret",  "Long-only Q5",  PALETTE[1]),
+        ("ls_ret",    "Long-Short Q5-Q1", PALETTE[0]),
+    ]:
+        if col not in port_rets.columns:
+            continue
+        r = port_rets.set_index("date")[col].fillna(0)
+        cum = (1 + r).cumprod()
+        ax1.plot(cum.index, cum.values, label=label, color=color, linewidth=1.8)
+        dd = (cum / cum.cummax() - 1)
+        ax2.fill_between(dd.index, dd.values, 0, alpha=0.4, color=color)
+
+    if benchmark_rets is not None:
+        bm = (1 + benchmark_rets.fillna(0)).cumprod()
+        ax1.plot(bm.index, bm.values, "--", color="#8b949e",
+                 linewidth=1.2, label="Benchmark")
+
+    ax1.set_title("Portfolio Equity Curve (1 EUR invested)",
+                  fontsize=13, fontweight="bold")
+    ax1.set_ylabel("Cumulative return")
+    ax1.legend(fontsize=10)
+    ax1.axhline(1, color="#8b949e", linestyle=":", linewidth=0.8)
+    ax2.set_ylabel("Drawdown")
+    ax2.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1, decimals=0))
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def plot_ablation(ablation_df: pd.DataFrame, save_path: Optional[str] = None):
+    """Horizontal bar chart of OOS AUC by feature block set."""
+    _apply_style()
+    df = ablation_df.sort_values("mean_auc")
+    fig, ax = plt.subplots(figsize=(10, max(5, len(df)*0.55)))
+    ax.barh(df["block_set"], df["mean_auc"],
+            color=PALETTE[0], alpha=0.85, edgecolo
